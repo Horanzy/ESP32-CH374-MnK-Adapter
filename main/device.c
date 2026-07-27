@@ -82,13 +82,25 @@ static const uint8_t xinput_config_descriptor[] = {
 // ==========================================
 // XInput 映射宏与查找表
 // ==========================================
-#define XINPUT_MOUSE_TO_STICK_SCALE 48
-#define XINPUT_MOUSE_TO_STICK_SCALE_X5 180
+#define XINPUT_MOUSE_TO_STICK_SCALE_HIP 40
+#define XINPUT_MOUSE_TO_STICK_SCALE_ADS 25
+#define XINPUT_MOUSE_TO_STICK_SCALE_LOOT 180
 
 #define XINPUT_STICK_MAX  32767
 #define XINPUT_STICK_MIN -32767
 #define XINPUT_STICK_DIAG  23170
 #define XINPUT_STICK_DIAG_N -23170
+
+#define MAX_OUT 32767
+#define NUM_INTERVALS 20
+
+#define RAW_MAX_DX_HIP (MAX_OUT / XINPUT_MOUSE_TO_STICK_SCALE_HIP)
+#define DX_STEP_HIP    ((RAW_MAX_DX_HIP + NUM_INTERVALS - 1) / NUM_INTERVALS)
+#define MAX_DX_HIP     (DX_STEP_HIP * NUM_INTERVALS)
+
+#define RAW_MAX_DX_ADS (MAX_OUT / XINPUT_MOUSE_TO_STICK_SCALE_ADS)
+#define DX_STEP_ADS    ((RAW_MAX_DX_ADS + NUM_INTERVALS - 1) / NUM_INTERVALS)
+#define MAX_DX_ADS     (DX_STEP_ADS * NUM_INTERVALS)
 
 #define XBOX_BUTTON_UP     (1 << 0)
 #define XBOX_BUTTON_DOWN   (1 << 1)
@@ -145,6 +157,10 @@ static const int16_t s_ly_lut[16] = {
     0, XINPUT_STICK_DIAG, 0, XINPUT_STICK_MAX, XINPUT_STICK_DIAG_N, 0, XINPUT_STICK_MIN, 0
 };
 
+// 鼠标响应曲线 LUT（由 update_mouse_curve 生成，HIP=腰射 / ADS=开镜）
+static int16_t s_lut_hip[NUM_INTERVALS + 1];
+static int16_t s_lut_ads[NUM_INTERVALS + 1];
+
 static inline int16_t clamp_s16(int32_t v) {
   if (v > 32767) return 32767;
   if (v < -32768) return -32768;
@@ -195,48 +211,135 @@ static inline void square_to_circle_int(int16_t x, int16_t y, int16_t *out_x, in
     *out_y = (int16_t)(((int32_t)y * max_side) / (int32_t)mag);
 }
 
+void update_mouse_curve(int32_t sag_level) {
+    if (sag_level < 0) sag_level = 0;
+    if (sag_level > 100) sag_level = 100;
+
+    for (int i = 0; i <= NUM_INTERVALS; i++) {
+        // --- 1. 计算腰射 (HIP) 曲线 ---
+        int32_t x_hip = i * DX_STEP_HIP;
+        int32_t y_lin_hip = x_hip * XINPUT_MOUSE_TO_STICK_SCALE_HIP;
+        if (y_lin_hip > MAX_OUT) y_lin_hip = MAX_OUT;
+
+        int64_t x64_hip = x_hip;
+        int32_t y_quad_hip = (int32_t)((x64_hip * x64_hip * MAX_OUT) / ((int64_t)MAX_DX_HIP * MAX_DX_HIP));
+        s_lut_hip[i] = (int16_t)(y_lin_hip + ((y_quad_hip - y_lin_hip) * sag_level) / 100);
+
+        // --- 2. 计算开镜 (ADS) 曲线 ---
+        int32_t x_ads = i * DX_STEP_ADS;
+        int32_t y_lin_ads = x_ads * XINPUT_MOUSE_TO_STICK_SCALE_ADS;
+        if (y_lin_ads > MAX_OUT) y_lin_ads = MAX_OUT;
+
+        int64_t x64_ads = x_ads;
+        int32_t y_quad_ads = (int32_t)((x64_ads * x64_ads * MAX_OUT) / ((int64_t)MAX_DX_ADS * MAX_DX_ADS));
+        s_lut_ads[i] = (int16_t)(y_lin_ads + ((y_quad_ads - y_lin_ads) * sag_level) / 100);
+    }
+}
+
+static inline int16_t apply_dynamic_curve(int32_t raw_delta, bool is_ads) {
+    int32_t abs_d = (raw_delta > 0) ? raw_delta : -raw_delta;
+
+    // 根据状态无缝切换参数
+    int32_t max_dx  = is_ads ? MAX_DX_ADS : MAX_DX_HIP;
+    int32_t dx_step = is_ads ? DX_STEP_ADS : DX_STEP_HIP;
+    int16_t *lut    = is_ads ? s_lut_ads : s_lut_hip;
+
+    if (abs_d >= max_dx) {
+        return (raw_delta > 0) ? MAX_OUT : -MAX_OUT;
+    }
+
+    int32_t index = abs_d / dx_step;
+    int32_t rem = abs_d % dx_step;
+
+    int32_t y0 = lut[index];
+    int32_t y1 = lut[index + 1];
+
+    int16_t mapped_val = (int16_t)(y0 + ((y1 - y0) * rem) / dx_step);
+
+    return (raw_delta > 0) ? mapped_val : -mapped_val;
+}
+
 static void build_xinput_report(raw_input_state_t const *in, ReportDataXinput *out) {
     out->rid   = 0x00;
     out->rsize = 0x14;
-    uint8_t wasd = 0;
-    if (in->kbd_modifier & ((1u << 0) | (1u << 4))) out->buttons |= XBOX_BUTTON_B;   // Ctrl
-    if (in->kbd_modifier & ((1u << 2) | (1u << 3))) out->buttons |= XBOX_BUTTON_DOWN;// Alt
-    if (in->kbd_modifier & ((1u << 1) | (1u << 5))) out->buttons |= XBOX_BUTTON_L3;  // Shift
 
+    uint16_t buttons = 0;
     int16_t temp_x = 0, temp_y = 0, recoil_offset = 0;
+    uint8_t wasd = 0;
+
+    static uint8_t jitter_tick = 0;
+    static int16_t current_jitter_amp = 990;
+    int16_t jitter = 0;
+    bool is_ads = false;
+
+    if(jitter_tick >= 15) {
+        current_jitter_amp = -current_jitter_amp;
+        jitter_tick = 0;
+    } else {
+        jitter_tick++;
+    }
+
+    if (in->kbd_modifier & ((1u << 0) | (1u << 4))) buttons |= XBOX_BUTTON_B;   // Ctrl
+    if (in->kbd_modifier & ((1u << 2) | (1u << 3))) buttons |= XBOX_BUTTON_DOWN;// Alt
+    if (in->kbd_modifier & ((1u << 1) | (1u << 5))) buttons |= XBOX_BUTTON_L3;  // Shift
 
     for (uint8_t i = 0; i < 6; i++) {
         uint8_t kc = in->kbd_keycode[i];
-        out->buttons |= s_key_lut_btn[kc];
-        wasd |= s_key_lut_wasd[kc];
+        if(kc == 0) continue;
+        buttons |= s_key_lut_btn[kc];
+        wasd    |= s_key_lut_wasd[kc];
     }
 
-    if(in->mouse_buttons & (1u << 4)) {
+    if(in->mouse_buttons & (1u << 4)) { // 特殊鼠标侧键逻辑（舔包模式）
         out->r_x = s_lx_lut[wasd & 0x0F];
         out->r_y = s_ly_lut[wasd & 0x0F];
         if(in->mouse_wheel < 0) out->r_y = -32767;
         if(in->mouse_wheel > 0) out->r_y = 32767;
-        square_to_circle_int(clamp_s16(in->mouse_dx * XINPUT_MOUSE_TO_STICK_SCALE_X5),
-                         clamp_s16(-in->mouse_dy * XINPUT_MOUSE_TO_STICK_SCALE_X5),
-                         &temp_x, &temp_y);
+
+        int16_t target_loot_x = clamp_s16(in->mouse_dx * XINPUT_MOUSE_TO_STICK_SCALE_LOOT);
+        int16_t target_loot_y = clamp_s16(-in->mouse_dy * XINPUT_MOUSE_TO_STICK_SCALE_LOOT);
+        static int32_t smooth_loot_x_fp = 0;
+        static int32_t smooth_loot_y_fp = 0;
+        const  uint8_t EMA_SHIFT_LOOT = 1;
+
+        smooth_loot_x_fp += (( (int32_t)target_loot_x << 8 ) - smooth_loot_x_fp) >> EMA_SHIFT_LOOT;
+        smooth_loot_y_fp += (( (int32_t)target_loot_y << 8 ) - smooth_loot_y_fp) >> EMA_SHIFT_LOOT;
+        int32_t final_loot_x = (int16_t)(smooth_loot_x_fp >> 8);
+        int32_t final_loot_y = (int16_t)(smooth_loot_y_fp >> 8);
+
+        square_to_circle_int(final_loot_x, final_loot_y, &temp_x, &temp_y);
         out->l_x = temp_x;
         out->l_y = temp_y;
-        if (in->mouse_buttons & (1u << 0)) out->buttons |= XBOX_BUTTON_A;
-        if (in->mouse_buttons & (1u << 1)) out->buttons |= XBOX_BUTTON_X;
-    } else {
+
+        if (in->mouse_buttons & (1u << 0)) buttons |= XBOX_BUTTON_A;
+        if (in->mouse_buttons & (1u << 1)) buttons |= XBOX_BUTTON_X;
+    } else { // 正常视角映射
         out->l_x = s_lx_lut[wasd & 0x0F];
         out->l_y = s_ly_lut[wasd & 0x0F];
-        if (in->mouse_buttons & (1u << 0)) { out->rt = 255; recoil_offset = -200; } 
-        if (in->mouse_buttons & (1u << 1)) { out->lt = 255; recoil_offset *= 4; } 
-        if (in->mouse_buttons & (1u << 2)) out->buttons |= XBOX_BUTTON_RB;
-        if (in->mouse_buttons & (1u << 3)) out->buttons |= XBOX_BUTTON_UP;
-        if (in->mouse_wheel != 0)          out->buttons |= XBOX_BUTTON_Y;
-        square_to_circle_int(clamp_s16(in->mouse_dx * XINPUT_MOUSE_TO_STICK_SCALE),
-                         clamp_s16(-in->mouse_dy * XINPUT_MOUSE_TO_STICK_SCALE + recoil_offset),
-                         &temp_x, &temp_y);
+        if (in->mouse_buttons & (1u << 0)) { out->rt = 255; recoil_offset = -250; jitter = current_jitter_amp; }
+        if (in->mouse_buttons & (1u << 1)) { out->lt = 255; recoil_offset *= 2; is_ads = true; }
+        if (in->mouse_buttons & (1u << 2)) buttons |= XBOX_BUTTON_RB;
+        if (in->mouse_buttons & (1u << 3)) buttons |= XBOX_BUTTON_UP;
+        if (in->mouse_wheel != 0)          buttons |= XBOX_BUTTON_Y;
+        int16_t target_x = apply_dynamic_curve(in->mouse_dx, is_ads);
+        int16_t target_y = apply_dynamic_curve(-in->mouse_dy, is_ads); // 注意反转
+
+        static int32_t smooth_x_fp = 0;
+        static int32_t smooth_y_fp = 0;
+        const  uint8_t EMA_SHIFT = 1;
+        smooth_x_fp += (( (int32_t)target_x << 8 ) - smooth_x_fp) >> EMA_SHIFT;
+        smooth_y_fp += (( (int32_t)target_y << 8 ) - smooth_y_fp) >> EMA_SHIFT;
+        int32_t final_x = (int16_t)(smooth_x_fp >> 8);
+        int32_t final_y = (int16_t)(smooth_y_fp >> 8);
+
+        square_to_circle_int(clamp_s16(final_x + jitter),
+                             clamp_s16(final_y + recoil_offset),
+                             &temp_x, &temp_y);
         out->r_x = temp_x;
         out->r_y = temp_y;
     }
+
+    out->buttons = buttons;
 }
 
 // ==========================================
@@ -438,6 +541,9 @@ static void usb_device_task(void *pvParameters) {
     
     // 4. 开启总线复位、总线挂起、传输完成中断输出
     ch374_write_reg(REG_INTER_EN, 0x07);
+
+    // 初始化鼠标响应曲线 LUT（sag_level=50：线性与二次各半混合）
+    update_mouse_curve(50);
 
     while (1) {
         if (gpio_get_level(DEVICE_INT_PIN) == 0) {
