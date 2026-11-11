@@ -46,7 +46,7 @@ static uint8_t *dma_tx_buf = NULL;
 static uint8_t *dma_rx_buf = NULL;
 
 static uint8_t kbd_data[8] = {0};
-static uint8_t mouse_data[8] = {0};
+static uint8_t mouse_data[9] = {0}; // G304 鼠标报告固定 9 字节（Report ID 0x02）
 
 // ==========================================
 // 热插拔状态机定义
@@ -69,7 +69,7 @@ typedef struct {
     usb_state_t state;
     uint64_t state_timer_us; // 记录状态切换时的时间戳
     
-    bool ep1_in_toggle;
+    bool ep_in_toggle; // 数据端点 IN 的 DATA0/1 toggle（键盘=EP1，鼠标=EP2）
     bool is_low_speed;
     bool is_keyboard; 
 } ch374_dev_t;
@@ -245,7 +245,7 @@ static void process_usb_device_statemachine(ch374_dev_t *dev, uint64_t current_t
                         }
                         
                         // 枚举成功！
-                        dev->ep1_in_toggle = false;
+                        dev->ep_in_toggle = false;
                         dev->state = STATE_ONLINE;
                         ESP_LOGI(TAG, "[%s] ONLINE and Ready!", dev->name);
                         break;
@@ -259,9 +259,10 @@ static void process_usb_device_statemachine(ch374_dev_t *dev, uint64_t current_t
 
         case STATE_ONLINE:
             {
-                uint8_t stat = ch374_exec_transaction(dev, 0x91, dev->ep1_in_toggle);
+                // 键盘数据端点为 EP1(令牌 0x91)；G304 接收器(C53F)的鼠标接口在 EP2(令牌 0x92)
+                uint8_t stat = ch374_exec_transaction(dev, dev->is_keyboard ? 0x91 : 0x92, dev->ep_in_toggle);
                 uint8_t pid = stat & 0x0F; // 提取实际的 PID
-                
+
                 // 修复：依据 PID 是否为 0x03(DATA0) 或 0x0B(DATA1) 判断成功
                 if (pid == 0x03 || pid == 0x0B) {
                     if (dev->is_keyboard) {
@@ -270,16 +271,29 @@ static void process_usb_device_statemachine(ch374_dev_t *dev, uint64_t current_t
                         uint8_t *keycodes = &kbd_data[2];
                         bridge_push_keyboard(keycodes, modifier);
                     } else {
-                        if(ch374_read_reg(dev, REG_USB_LENGTH) == 13) {
-                            ch374_read_multi(dev, RAM_HOST_RECV, mouse_data, 7);
-                            uint16_t buttons = (uint16_t)(mouse_data[0] | (mouse_data[1] << 8));
-                            int16_t dx = (int16_t)(mouse_data[2] | (mouse_data[3] << 8));
-                            int16_t dy = (int16_t)(mouse_data[4] | (mouse_data[5] << 8));
-                            int8_t wheel = (int8_t)mouse_data[6];
+                        // G304 鼠标固定走 Report ID 0x02，共 9 字节：
+                        // [0]=0x02 [1..2]=按键位图(u16) [3..4]=X(int16) [5..6]=Y(int16)
+                        // [7]=垂直滚轮(int8) [8]=水平滚轮(int8，忽略)
+                        // 接收器同端点还会出现报告 3/4/8（多媒体/系统键等），靠首字节过滤
+                        // 调试心跳：每 2000 个有效报告打一条计数（只在鼠标动的时候累加）
+                        static uint32_t g304_rx_count = 0;
+                        static bool g304_other_logged = false;
+                        ch374_read_multi(dev, RAM_HOST_RECV, mouse_data, 9);
+                        if (mouse_data[0] == 0x02) {
+                            uint16_t buttons = (uint16_t)(mouse_data[1] | (mouse_data[2] << 8));
+                            int16_t dx = (int16_t)(mouse_data[3] | (mouse_data[4] << 8));
+                            int16_t dy = (int16_t)(mouse_data[5] | (mouse_data[6] << 8));
+                            int8_t wheel = (int8_t)mouse_data[7];
                             bridge_push_mouse(buttons, dx, dy, wheel);
+                            if ((++g304_rx_count % 2000) == 1) {
+                                ESP_LOGI(TAG, "[Mouse] G304 rx=%u btn=0x%04X", (unsigned)g304_rx_count, buttons);
+                            }
+                        } else if (!g304_other_logged) {
+                            g304_other_logged = true;
+                            ESP_LOGI(TAG, "[Mouse] 忽略非鼠标报告 id=0x%02X", mouse_data[0]);
                         }
                     }
-                    dev->ep1_in_toggle = !dev->ep1_in_toggle;
+                    dev->ep_in_toggle = !dev->ep_in_toggle;
                 } else {
                     if (pid != 0x0A) { // 不是正常的 NAK
                         if (!(ch374_read_reg(dev, REG_HUB_SETUP) & 0x08)) {

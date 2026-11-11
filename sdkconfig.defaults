@@ -1,0 +1,4 @@
+# 两个应用任务（host / xinput_dev）是最高优先级忙循环，不释放 CPU，
+# IDLE 任务永远饿死；关闭看门狗对 IDLE 任务的监视，避免每 5s 刷 task_wdt 报错。
+# CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 is not set
+# CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1 is not set
